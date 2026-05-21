@@ -1,0 +1,27 @@
+{
+  "name": "showrunner",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node --import tsx src/cli.ts",
+    "dev": "tsx watch src/cli.ts",
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "smoke": "npm run build && node dist/smoke.js",
+    "observe": "node --import tsx src/scripts/observe-session.ts",
+    "smoke:paid-video": "node --import tsx src/scripts/paid-video-smoke.ts",
+    "test": "npm run check && npm run smoke",
+    "prototype": "node prototypes/showrunner-state-machine/tui.mjs"
+  },
+  "dependencies": {
+    "@openrouter/agent": "0.7.0",
+    "glob": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  }
+}

@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Showrunner local runtime state
+.showrunner/
+
+# Paid/generated production artifacts
+productions/*
+!productions/.gitkeep
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Test and coverage output
+coverage/
+.nyc_output/
+
+# Tool caches and temp files
+.cache/
+.tmp/
+tmp/
+temp/
+.vite/
+.turbo/
+
+# OS/editor noise
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.idea/
+.vscode/
+
+# Local-only overrides
+*.local
