@@ -1,6 +1,7 @@
 import { callModel, maxCost, OpenRouter, stepCountIs } from '@openrouter/agent';
 import type { AgentConfig } from './config.js';
 import { buildTools } from './tools/index.js';
+import type { ProductionActivitySink } from './activity.js';
 
 export type AgentEvent =
   | { type: 'text'; delta: string; itemId?: string }
@@ -15,6 +16,7 @@ export async function runShowrunnerAgent(input: string, options: {
   setProductionDir: (dir: string) => void;
   threadContext?: string;
   onEvent?: (event: AgentEvent) => void;
+  activity?: ProductionActivitySink;
 }): Promise<string> {
   if (!options.config.apiKey) throw new Error('OPENROUTER_API_KEY is required for conversational control.');
 
@@ -69,6 +71,7 @@ export async function runShowrunnerAgent(input: string, options: {
         maxTotalResults: options.config.webSearchMaxTotalResults,
         searchContextSize: options.config.webSearchContextSize,
       },
+      activity: options.activity,
     }),
     stopWhen: [stepCountIs(options.config.maxSteps), maxCost(options.config.maxCost)],
     allowFinalResponse: 'Summarize what changed, any real media generated, artifact paths, cost used, and the next natural action.',

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, mkdir, rm, stat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, stat } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
+import { createProductionActivitySink, summarizeActivityEvent, type ProductionActivityEvent } from './activity.js';
 import { inspectArtifacts, materializeProductionArtifacts } from './artifacts.js';
 import { DEFAULT_MUSIC_MODEL, DEFAULT_SHOWRUNNER_MODEL, DEFAULT_TTS_MODEL, DEFAULT_VIDEO_MODEL } from './config.js';
 import { applyAction, nextRecommendedAction } from './domain/controller.js';
@@ -59,6 +60,19 @@ assert.equal(isFreshProductionIntent('new production: create a 60 second short f
 assert.equal(isFreshProductionIntent('c', menuThread), true);
 assert.equal(resolveFreshProductionBrief({ line: 'new production', thread: menuThread }), 'create a 60 second short film about the nerfpocalypse with an AI engineer hero');
 assert.equal(resolveFreshProductionBrief({ line: 'new production: create a 60 second short film', thread: menuThread }), 'create a 60 second short film');
+
+const activityEvents: ProductionActivityEvent[] = [];
+const activitySink = createProductionActivitySink((event) => activityEvents.push(event));
+const activityEvent = activitySink.emit({
+  kind: 'run',
+  title: 'Planning new Production',
+  stage: 'brief',
+  subject: { type: 'Production', id: 'prod_smoke' },
+});
+assert.equal(activityEvents.length, 1);
+assert.equal(activityEvent.level, 'info');
+assert.match(summarizeActivityEvent(activityEvent), /Planning new Production/);
+assert.match(summarizeActivityEvent(activityEvent), /\[brief\]/);
 
 for (let i = 0; i < 500 && state.production.stage !== 'complete'; i++) {
   const action = nextRecommendedAction(state);
@@ -370,6 +384,11 @@ try {
   await saveProductionState(dir, state);
   const pages = await renderProductionPages(state, dir);
   assert.equal(pages.length, 2);
+  const productionPage = await readFile(pages.find((page) => page.endsWith('production.html')) ?? pages[0], 'utf-8');
+  assert.match(productionPage, /<h2>Activity<\/h2>/);
+  assert.match(productionPage, /Recent Events/);
+  assert.match(productionPage, /Model Routing/);
+  assert.match(productionPage, /Cost Ledger/);
 
   const threadPath = join(dir, '.showrunner', 'thread.json');
   const thread = createThread();

@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { inspectArtifacts, type ArtifactStatus } from '../artifacts.js';
-import { stageProgress } from '../domain/controller.js';
+import { legalActions, nextRecommendedAction, stageProgress } from '../domain/controller.js';
 import type { ProductionState } from '../domain/schema.js';
 import { referenceReadinessForShot } from '../references.js';
 
@@ -59,6 +59,7 @@ function renderProductionPage(state: ProductionState, artifacts: ArtifactStatus[
       <h2>Stage Gates</h2>
       <ol class="stages">${progress}</ol>
     </section>
+    ${renderActivitySection(state)}
     ${filmPackage}
     ${referenceSets}
     ${playable ? `
@@ -82,11 +83,86 @@ function renderProductionPage(state: ProductionState, artifacts: ArtifactStatus[
         <tbody>${shots || '<tr><td colspan="7">No shots yet.</td></tr>'}</tbody>
       </table>
     </section>
-    <section>
-      <h2>Recent Events</h2>
-      <ul>${state.eventLog.slice(-10).map((event) => `<li>${esc(event)}</li>`).join('')}</ul>
-    </section>
   `);
+}
+
+function renderActivitySection(state: ProductionState): string {
+  const nextAction = nextRecommendedAction(state)?.type;
+  const pendingApprovals = state.approvals.filter((approval) => approval.status === 'pending');
+  const recentEvents = state.eventLog.slice(-20);
+  const roleRows = Object.entries(state.production.routing.roles ?? {})
+    .map(([role, selection]) => `
+      <tr>
+        <td>${esc(role)}</td>
+        <td>${esc(selection.model)}</td>
+      </tr>`)
+    .join('');
+  const modalityRows = Object.entries(state.production.routing.modalities ?? {})
+    .map(([modality, selection]) => `
+      <tr>
+        <td>${esc(modality)}</td>
+        <td>${selection.preferredModels.map(esc).join('<br>')}</td>
+      </tr>`)
+    .join('');
+  const costRows = state.costs.slice(-10)
+    .map((cost) => `
+      <tr>
+        <td>${esc(cost.createdAt.replace('T', ' ').slice(0, 19))}</td>
+        <td>${esc(cost.kind)}<br><span class="muted">${esc(cost.subjectId)}</span></td>
+        <td>$${cost.costUsd.toFixed(4)}</td>
+      </tr>`)
+    .join('');
+  const approvalRows = pendingApprovals
+    .map((approval) => `
+      <tr>
+        <td>${esc(approval.kind)}</td>
+        <td>${esc(approval.subjectId)}</td>
+        <td>${approval.costUsd === undefined ? '-' : `$${approval.costUsd.toFixed(2)}`}</td>
+        <td>${esc(approval.reason)}</td>
+      </tr>`)
+    .join('');
+
+  return `
+    <section>
+      <h2>Activity</h2>
+      <div class="metrics">
+        <span>Next <strong>${esc(formatAction(nextAction))}</strong></span>
+        <span>Allowed <strong>${esc(legalActions(state).map(formatAction).join(', '))}</strong></span>
+        <span>Pending approvals <strong>${pendingApprovals.length}</strong></span>
+        <span>Last event <strong>${esc(recentEvents.at(-1) ?? 'No events yet.')}</strong></span>
+      </div>
+      <div class="activity-grid">
+        <details open>
+          <summary>Recent Events</summary>
+          <ol class="event-list">${recentEvents.map((event) => `<li>${esc(event)}</li>`).join('') || '<li>No events yet.</li>'}</ol>
+        </details>
+        <details open>
+          <summary>Model Routing</summary>
+          <table>
+            <thead><tr><th>Role</th><th>Model</th></tr></thead>
+            <tbody>${roleRows || '<tr><td colspan="2">No text roles routed yet.</td></tr>'}</tbody>
+          </table>
+          <table>
+            <thead><tr><th>Media</th><th>Preferred Models</th></tr></thead>
+            <tbody>${modalityRows || '<tr><td colspan="2">No media models routed yet.</td></tr>'}</tbody>
+          </table>
+        </details>
+        <details>
+          <summary>Approvals</summary>
+          <table>
+            <thead><tr><th>Kind</th><th>Subject</th><th>Cost</th><th>Reason</th></tr></thead>
+            <tbody>${approvalRows || '<tr><td colspan="4">No pending approvals.</td></tr>'}</tbody>
+          </table>
+        </details>
+        <details>
+          <summary>Cost Ledger</summary>
+          <table>
+            <thead><tr><th>Time</th><th>Item</th><th>Cost</th></tr></thead>
+            <tbody>${costRows || '<tr><td colspan="3">No costs recorded yet.</td></tr>'}</tbody>
+          </table>
+        </details>
+      </div>
+    </section>`;
 }
 
 function renderFinishedShots(state: ProductionState): string {
@@ -289,6 +365,13 @@ function layout(state: ProductionState, body: string): string {
     .stages li { border:1px solid var(--line); border-radius:999px; padding:6px 10px; color:var(--muted); }
     .stages .done { color:var(--ok); }
     .stages .current { color:var(--accent); border-color:var(--accent); }
+    .activity-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:16px; margin-top:18px; }
+    .activity-grid table { table-layout:auto; margin-top:8px; }
+    .activity-grid th:nth-child(1), .activity-grid td:nth-child(1), .activity-grid th:nth-child(3), .activity-grid td:nth-child(3) { width:auto; }
+    details { border-top:1px solid var(--line); padding-top:12px; min-width:0; }
+    summary { cursor:pointer; color:var(--accent); font-weight:600; margin-bottom:10px; }
+    .event-list { margin:0; padding-left:20px; }
+    .event-list li { margin:0 0 8px; overflow-wrap:anywhere; }
     .muted { color:var(--muted); }
     a { color:var(--accent); }
   </style>
@@ -311,6 +394,10 @@ function esc(value: string): string {
     '"': '&quot;',
     "'": '&#39;',
   }[char] ?? char));
+}
+
+function formatAction(action: string | undefined): string {
+  return action ? action.replace(/_/g, ' ') : 'none';
 }
 
 function formatBytes(bytes: number): string {

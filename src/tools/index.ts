@@ -42,6 +42,7 @@ import {
   referencesForShot,
 } from '../references.js';
 import { planReferenceImageGeneration } from '../referenceCraft.js';
+import type { ProductionActivityInput, ProductionActivitySink } from '../activity.js';
 
 export interface ToolRuntime {
   apiKey: string;
@@ -63,6 +64,7 @@ export interface ToolRuntime {
     maxTotalResults: number;
     searchContextSize: 'low' | 'medium' | 'high';
   };
+  activity?: ProductionActivitySink;
 }
 
 const execFileAsync = promisify(execFile);
@@ -78,6 +80,7 @@ export interface RegenerateShotsInput {
 
 export interface ToolProgressHooks {
   onProgress?: (message: string) => void;
+  activity?: ProductionActivitySink;
 }
 
 export interface GenerateRemainingTakesInput {
@@ -111,7 +114,19 @@ export function buildTools(runtime: ToolRuntime) {
       execute: async ({ brief, title, advanceToFirstApproval }) => {
         let state = createInitialState({ brief, title, routingPolicy: runtime.routingPolicy });
         applyBriefConstraints(state, brief);
+        emitActivity(runtime, undefined, state, {
+          kind: 'run',
+          title: 'Planning new Production',
+          detail: state.production.title,
+          subject: { type: 'Production', id: state.production.id },
+        });
         const directorModel = await routeTextModel(runtime, state, 'director');
+        emitActivity(runtime, undefined, state, {
+          kind: 'model',
+          title: 'Routed Director planning',
+          model: directorModel.model,
+          subject: { type: 'Model', id: directorModel.model },
+        });
         const plan = await planProductionWithOpenRouter({
           apiKey: runtime.apiKey,
           model: directorModel.model,
@@ -119,6 +134,12 @@ export function buildTools(runtime: ToolRuntime) {
           runtimeSeconds: state.production.target.runtimeSeconds,
         });
         applyProductionPlan(state, plan.plan);
+        emitActivity(runtime, undefined, state, {
+          kind: 'stage',
+          title: 'Storyboard plan ready',
+          detail: planSummary(plan.plan),
+          subject: { type: 'Production', id: state.production.id },
+        });
         const refinements = await refineCreativeText(runtime, state);
         rebuildReferenceSetsFromCurrentState(state);
         state.eventLog.push(`Created ${plan.source} storyboard plan${plan.model ? ` with ${plan.model}` : ''}: ${planSummary(plan.plan)}`);
@@ -138,11 +159,23 @@ export function buildTools(runtime: ToolRuntime) {
             const result = applyAction(state, action);
             state = result.state;
             messages.push(result.message);
+            emitActivity(runtime, undefined, state, {
+              kind: result.blocked ? 'blocked' : 'stage',
+              level: result.blocked ? 'warning' : 'info',
+              title: result.message,
+            });
             if (result.blocked || state.approvals.some((approval) => approval.status === 'pending')) break;
           }
         }
         await saveProductionState(dir, state);
         await renderProductionPages(state, dir);
+        emitActivity(runtime, undefined, state, {
+          kind: 'complete',
+          level: 'success',
+          title: 'Production plan saved',
+          detail: dir,
+          artifactPath: `${dir}/pages/production.html`,
+        });
         runtime.setProductionDir(dir);
         return {
           directory: dir,
@@ -168,6 +201,12 @@ export function buildTools(runtime: ToolRuntime) {
       execute: async ({ brief, discardExistingTakes }) => {
         const dir = requireProductionDir(runtime);
         const state = await loadProductionState(dir);
+        emitActivity(runtime, undefined, state, {
+          kind: 'run',
+          title: 'Replanning Production',
+          detail: brief?.trim() ? 'Using replacement brief.' : 'Using current brief.',
+          subject: { type: 'Production', id: state.production.id },
+        });
         if (brief?.trim()) {
           state.production.brief = brief.trim();
           state.production.title = brief.trim().slice(0, 60);
@@ -175,6 +214,12 @@ export function buildTools(runtime: ToolRuntime) {
         }
         if (discardExistingTakes) rejectExistingTakesAndDownstream(state);
         const directorModel = await routeTextModel(runtime, state, 'director');
+        emitActivity(runtime, undefined, state, {
+          kind: 'model',
+          title: 'Routed Director planning',
+          model: directorModel.model,
+          subject: { type: 'Model', id: directorModel.model },
+        });
         const plan = await planProductionWithOpenRouter({
           apiKey: runtime.apiKey,
           model: directorModel.model,
@@ -190,6 +235,13 @@ export function buildTools(runtime: ToolRuntime) {
         if (plan.warning) state.eventLog.push(`Planner fallback warning: ${plan.warning}`);
         await saveProductionState(dir, state);
         const pages = await renderProductionPages(state, dir);
+        emitActivity(runtime, undefined, state, {
+          kind: 'complete',
+          level: 'success',
+          title: 'Replan saved',
+          detail: planSummary(plan.plan),
+          artifactPath: pages[0],
+        });
         return {
           message: `Replanned Production. ${planSummary(plan.plan)}`,
           decisions: filmPackageDecisionMessages(state),
@@ -410,14 +462,36 @@ export function buildTools(runtime: ToolRuntime) {
       execute: async () => {
         const dir = requireProductionDir(runtime);
         let state = await loadProductionState(dir);
+        emitActivity(runtime, undefined, state, {
+          kind: 'run',
+          title: 'Finishing Production',
+          detail: 'Building Sound Mix, Export, and Final Review artifacts.',
+          subject: { type: 'Production', id: state.production.id },
+        });
         const advanced = advanceDeterministicStages(state, 100);
         state = advanced.state;
+        for (const message of advanced.messages) {
+          emitActivity(runtime, undefined, state, { kind: 'stage', title: message });
+        }
         await ensureFilmAudio(runtime, dir, state);
         const afterAudioAdvanced = advanceDeterministicStages(state, 100);
         state = afterAudioAdvanced.state;
+        for (const message of afterAudioAdvanced.messages) {
+          emitActivity(runtime, undefined, state, {
+            kind: afterAudioAdvanced.blocked ? 'blocked' : 'stage',
+            level: afterAudioAdvanced.blocked ? 'warning' : 'info',
+            title: message,
+          });
+        }
         const artifacts = await materializeProductionArtifacts(state, dir);
         await saveProductionState(dir, state);
         const pages = await renderProductionPages(state, dir);
+        emitActivity(runtime, undefined, state, {
+          kind: 'complete',
+          level: afterAudioAdvanced.blocked ? 'warning' : 'success',
+          title: afterAudioAdvanced.blocked ? 'Finish paused' : 'Finished production artifacts',
+          artifactPath: pages[0],
+        });
         const soundMixSources = state.soundMixes.map((mix) => ({
           id: mix.id,
           summary: soundMixSourceSummary(mix),
@@ -578,10 +652,25 @@ export async function regenerateShotsWithOpenRouter(
   const messages: string[] = [];
 
   assertKnownShots(state, targetIds);
+  emitActivity(runtime, hooks, state, {
+    kind: 'run',
+    title: 'Starting Shot regeneration',
+    detail: `Repairing ${targetIds.join(', ')} with a $${input.approvedBudgetUsd.toFixed(2)} cap.`,
+    subject: { type: 'Shot', label: targetIds.join(', ') },
+  });
 
   if (input.refreshPrompts) {
-    hooks.onProgress?.(`Refreshing prompts for ${targetIds.join(', ')}.`);
+    progressActivity(runtime, hooks, state, `Refreshing Motion Prompts`, {
+      detail: targetIds.join(', '),
+      subject: { type: 'Shot', label: targetIds.join(', ') },
+    });
     const directorModel = await routeTextModel(runtime, state, 'director');
+    emitActivity(runtime, hooks, state, {
+      kind: 'model',
+      title: 'Routed Director planning',
+      model: directorModel.model,
+      subject: { type: 'Model', id: directorModel.model },
+    });
     const plan = await planProductionWithOpenRouter({
       apiKey: runtime.apiKey,
       model: directorModel.model,
@@ -598,7 +687,10 @@ export async function regenerateShotsWithOpenRouter(
 
   const rejected = prepareShotRegeneration(state, targetIds, input.reason);
   messages.push(`Rejected ${rejected.length} prior Takes for repair.`);
-  hooks.onProgress?.(`Rejected ${rejected.length} prior Takes and queued paid repair.`);
+  progressActivity(runtime, hooks, state, 'Queued paid repair', {
+    detail: `Rejected ${rejected.length} prior Takes.`,
+    subject: { type: 'Take', label: `${rejected.length} rejected` },
+  });
   await saveProductionState(dir, state);
   await renderProductionPages(state, dir);
 
@@ -637,12 +729,16 @@ export async function regenerateShotsWithOpenRouter(
     }
 
     const approvedTake = state.takes.find((take) => take.status === 'approved');
-    hooks.onProgress?.(`Submitting ${approvedTake?.shotId ?? targetIds[i]} to OpenRouter video.`);
+    progressActivity(runtime, hooks, state, 'Submitting video Take', {
+      detail: approvedTake ? `${approvedTake.id} for ${approvedTake.shotId}` : targetIds[i],
+      subject: { type: 'Take', id: approvedTake?.id, label: approvedTake?.shotId ?? targetIds[i] },
+      progress: { label: 'repair', current: i + 1, total: targetIds.length },
+    });
     const result = await generateApprovedTake(runtime, dir, state, {
       model: input.model,
       generateAudio: input.generateAudio,
       spendCeilingUsd: spendCeiling,
-    });
+    }, hooks);
     state = result.state;
     generated.push({
       takeId: result.takeId,
@@ -653,10 +749,18 @@ export async function regenerateShotsWithOpenRouter(
       fileSize: result.fileSize,
     });
     messages.push(`Regenerated ${result.takeId} for ${result.shotId}.`);
-    hooks.onProgress?.(`Downloaded ${result.takeId} for ${result.shotId} ($${result.costUsd.toFixed(2)}).`);
+    emitActivity(runtime, hooks, state, {
+      kind: 'artifact',
+      level: 'success',
+      title: 'Downloaded repaired Take',
+      detail: `${result.takeId} for ${result.shotId}`,
+      subject: { type: 'Take', id: result.takeId, label: result.shotId },
+      artifactPath: result.mediaPath,
+      costUsd: result.costUsd,
+    });
   }
 
-  hooks.onProgress?.('Rebuilding assembly, sound mix, export, and final review.');
+  progressActivity(runtime, hooks, state, 'Rebuilding Assembly, Sound Mix, Export, and Final Review');
   const advanced = advanceDeterministicStages(state, 100);
   state = advanced.state;
   messages.push(...advanced.messages);
@@ -698,13 +802,21 @@ export async function runFullProductionWithOpenRouter(
     Math.max(0, totalCeiling - state.production.budgetGuardrail.spentUsd),
   );
 
-  hooks.onProgress?.(`Generating missing Reference images with a $${referenceBudget.toFixed(2)} Reference cap.`);
+  emitActivity(runtime, hooks, state, {
+    kind: 'run',
+    title: 'Starting full Production run',
+    detail: `Approved cap $${input.approvedBudgetUsd.toFixed(2)}. Reference cap $${referenceBudget.toFixed(2)}.`,
+    subject: { type: 'Production', id: state.production.id },
+  });
+  progressActivity(runtime, hooks, state, 'Generating missing References', {
+    detail: `$${referenceBudget.toFixed(2)} Reference cap`,
+  });
   const references = referenceBudget > 0
     ? await ensureReferenceAssets(runtime, dir, state, {
       approvedBudgetUsd: referenceBudget,
       model: input.imageModel,
       maxReferences: input.maxReferences,
-    })
+    }, hooks)
     : [];
   await saveProductionState(dir, state);
   await renderProductionPages(state, dir);
@@ -715,7 +827,10 @@ export async function runFullProductionWithOpenRouter(
     throw new Error(`Reference generation consumed the approved budget ceiling $${totalCeiling.toFixed(2)} before video generation could start.`);
   }
 
-  hooks.onProgress?.(`Generating remaining real video Takes with a $${remainingBudget.toFixed(2)} remaining cap.`);
+  progressActivity(runtime, hooks, state, 'Generating remaining Takes', {
+    detail: `$${remainingBudget.toFixed(2)} remaining cap`,
+    subject: { type: 'Take', label: 'remaining planned Takes' },
+  });
   const takeRun = await generateRemainingTakesBatch(runtime, dir, state, {
     approvedBudgetUsd: remainingBudget,
     model: input.videoModel,
@@ -771,6 +886,12 @@ async function generateRemainingTakesBatch(
     fileSize: number;
   }> = [];
   const messages: string[] = [];
+  emitActivity(runtime, hooks, state, {
+    kind: 'run',
+    title: 'Generating planned Takes',
+    detail: `Budget ceiling $${spendCeiling.toFixed(2)}.`,
+    subject: { type: 'Take', label: 'planned Takes' },
+  });
 
   for (let i = 0; i < input.maxTakes; i++) {
     if (state.production.stage !== 'takes') break;
@@ -788,6 +909,10 @@ async function generateRemainingTakesBatch(
         const advanced = applyAction(state, action);
         state = advanced.state;
         messages.push(advanced.message);
+        emitActivity(runtime, hooks, state, {
+          kind: 'stage',
+          title: advanced.message,
+        });
         break;
       }
       if (action.type !== 'preview_take') {
@@ -797,6 +922,11 @@ async function generateRemainingTakesBatch(
       const previewed = applyAction(state, action);
       state = previewed.state;
       messages.push(previewed.message);
+      emitActivity(runtime, hooks, state, {
+        kind: previewed.blocked ? 'blocked' : 'approval',
+        level: previewed.blocked ? 'warning' : 'info',
+        title: previewed.message,
+      });
     }
 
     if (state.approvals.some((approval) => approval.status === 'pending')) {
@@ -806,12 +936,18 @@ async function generateRemainingTakesBatch(
     }
 
     const approvedTake = state.takes.find((take) => take.status === 'approved');
-    if (approvedTake) hooks.onProgress?.(`Submitting real video for ${approvedTake.id} (${approvedTake.shotId}).`);
+    if (approvedTake) {
+      progressActivity(runtime, hooks, state, 'Submitting video Take', {
+        detail: `${approvedTake.id} for ${approvedTake.shotId}`,
+        subject: { type: 'Take', id: approvedTake.id, label: approvedTake.shotId },
+        progress: { label: 'Takes', current: generated.length + 1, total: Math.min(input.maxTakes, state.shots.length) },
+      });
+    }
     const result = await generateApprovedTake(runtime, dir, state, {
       model: input.model,
       generateAudio: input.generateAudio,
       spendCeilingUsd: spendCeiling,
-    });
+    }, hooks);
     state = result.state;
     generated.push({
       takeId: result.takeId,
@@ -822,20 +958,45 @@ async function generateRemainingTakesBatch(
       fileSize: result.fileSize,
     });
     messages.push(`Generated ${result.takeId} for ${result.shotId}.`);
-    hooks.onProgress?.(`Downloaded ${result.takeId} for ${result.shotId} ($${result.costUsd.toFixed(2)}).`);
+    emitActivity(runtime, hooks, state, {
+      kind: 'artifact',
+      level: 'success',
+      title: 'Downloaded Take',
+      detail: `${result.takeId} for ${result.shotId}`,
+      subject: { type: 'Take', id: result.takeId, label: result.shotId },
+      artifactPath: result.mediaPath,
+      costUsd: result.costUsd,
+    });
   }
 
-  hooks.onProgress?.('Rebuilding assembly, sound mix, export, and final review.');
+  progressActivity(runtime, hooks, state, 'Rebuilding Assembly, Sound Mix, Export, and Final Review');
   const advanced = advanceDeterministicStages(state, 100);
   state = advanced.state;
   messages.push(...advanced.messages);
+  for (const message of advanced.messages) {
+    emitActivity(runtime, hooks, state, { kind: 'stage', title: message });
+  }
   await ensureFilmAudio(runtime, dir, state, hooks);
   const afterAudioAdvanced = advanceDeterministicStages(state, 100);
   state = afterAudioAdvanced.state;
   messages.push(...afterAudioAdvanced.messages);
+  for (const message of afterAudioAdvanced.messages) {
+    emitActivity(runtime, hooks, state, {
+      kind: afterAudioAdvanced.blocked ? 'blocked' : 'stage',
+      level: afterAudioAdvanced.blocked ? 'warning' : 'info',
+      title: message,
+    });
+  }
   const artifacts = await materializeProductionArtifacts(state, dir);
   await saveProductionState(dir, state);
   const pages = await renderProductionPages(state, dir);
+  emitActivity(runtime, hooks, state, {
+    kind: 'complete',
+    level: afterAudioAdvanced.blocked ? 'warning' : 'success',
+    title: afterAudioAdvanced.blocked ? 'Production run paused' : 'Production run complete',
+    detail: summarizeState(state).split('\n')[0],
+    artifactPath: pages[0],
+  });
 
   return {
     message: `Generated ${generated.length} Takes within approved $${input.approvedBudgetUsd.toFixed(2)} cap.`,
@@ -855,6 +1016,36 @@ function requireProductionDir(runtime: ToolRuntime): string {
   const dir = runtime.getProductionDir();
   if (!dir) throw new Error('No active Production. Create or load one first.');
   return dir;
+}
+
+function emitActivity(
+  runtime: ToolRuntime,
+  hooks: ToolProgressHooks | undefined,
+  state: ProductionState,
+  input: ProductionActivityInput,
+): void {
+  const event = {
+    productionId: state.production.id,
+    stage: state.production.stage,
+    ...input,
+  };
+  runtime.activity?.emit(event);
+  hooks?.activity?.emit(event);
+}
+
+function progressActivity(
+  runtime: ToolRuntime,
+  hooks: ToolProgressHooks | undefined,
+  state: ProductionState,
+  title: string,
+  input: Omit<ProductionActivityInput, 'title' | 'kind'> = {},
+): void {
+  hooks?.onProgress?.(input.detail ? `${title}: ${input.detail}` : title);
+  emitActivity(runtime, hooks, state, {
+    kind: 'progress',
+    title,
+    ...input,
+  });
 }
 
 function applyBriefConstraints(state: Awaited<ReturnType<typeof loadProductionState>>, brief: string): void {
@@ -1034,6 +1225,7 @@ async function ensureReferenceAssets(
     model?: string;
     maxReferences: number;
   },
+  hooks: ToolProgressHooks = {},
 ): Promise<Array<{ id: string; path: string; model: string; costUsd: number }>> {
   if (!runtime.apiKey) throw new Error('Cannot generate Reference assets: OPENROUTER_API_KEY is missing.');
   if (!state.filmPackage) throw new Error('Cannot generate Reference assets before the Film Package exists.');
@@ -1059,6 +1251,12 @@ async function ensureReferenceAssets(
     });
     const relativePath = join('assets', 'references', `${ref.id}.png`);
     const outputPath = join(dir, relativePath);
+    progressActivity(runtime, hooks, state, 'Generating Reference', {
+      detail: `${ref.kind} ${ref.id}`,
+      subject: { type: 'Reference', id: ref.id, label: ref.kind },
+      progress: { label: 'References', current: generated.length + 1, total: missing.length },
+      model: craft.model.id,
+    });
     const result = await generateImage({
       apiKey: runtime.apiKey,
       model: craft.model.id,
@@ -1083,6 +1281,16 @@ async function ensureReferenceAssets(
     });
     generated.push({ id: ref.id, path: relativePath, model: craft.model.id, costUsd });
     state.eventLog.push(`Generated ${ref.kind} ${ref.id} with ${craft.model.id}: ${craft.selectionReason}.`);
+    emitActivity(runtime, hooks, state, {
+      kind: 'artifact',
+      level: 'success',
+      title: 'Reference ready',
+      detail: craft.selectionReason,
+      subject: { type: 'Reference', id: ref.id, label: ref.kind },
+      model: craft.model.id,
+      costUsd,
+      artifactPath: relativePath,
+    });
   }
 
   if (generated.length > 0) {
@@ -1132,7 +1340,12 @@ async function ensureFilmAudio(
       if (state.production.budgetGuardrail.spentUsd + costUsd > state.production.budgetGuardrail.maxUsd) {
         throw new Error(`Estimated ${item.kind} cost $${costUsd.toFixed(4)} would exceed budget ceiling $${state.production.budgetGuardrail.maxUsd.toFixed(2)}.`);
       }
-      hooks.onProgress?.(`Generating ${item.directory} ${item.line.id}.`);
+      progressActivity(runtime, hooks, state, 'Generating speech', {
+        detail: `${item.directory} ${item.line.id}`,
+        subject: { type: 'Sound Element', id: item.line.id, label: item.directory },
+        model,
+        costUsd,
+      });
       await synthesizeSpeechWithVoiceFallback({
         apiKey: runtime.apiKey,
         model,
@@ -1149,6 +1362,16 @@ async function ensureFilmAudio(
         kind: item.kind,
         costUsd,
         createdAt: new Date().toISOString(),
+      });
+      emitActivity(runtime, hooks, state, {
+        kind: 'artifact',
+        level: 'success',
+        title: 'Speech ready',
+        detail: `${item.directory} ${item.line.id}`,
+        subject: { type: 'Sound Element', id: item.line.id, label: item.directory },
+        model,
+        costUsd,
+        artifactPath: audioPath,
       });
       generatedSpeech += 1;
     }
@@ -1234,7 +1457,11 @@ async function ensureFilmMusic(
         defaultModel: runtime.musicModel,
       });
       recordModalityModel(state, 'audio', selection);
-      hooks.onProgress?.(`Generating music cue ${music.id ?? 'music_1'} with ${selection.model}.`);
+      progressActivity(runtime, hooks, state, 'Generating Music Cue', {
+        detail: music.id ?? 'music_1',
+        subject: { type: 'Sound Element', id: music.id ?? 'music_1', label: 'Music Cue' },
+        model: selection.model,
+      });
       const result = await generateAudio({
         apiKey: runtime.apiKey,
         model: selection.model,
@@ -1257,13 +1484,26 @@ async function ensureFilmMusic(
         createdAt: new Date().toISOString(),
       });
       state.eventLog.push(`Generated music cue ${music.id ?? 'music_1'} with ${selection.model}.`);
+      emitActivity(runtime, hooks, state, {
+        kind: 'artifact',
+        level: 'success',
+        title: 'Music Cue ready',
+        detail: music.id ?? 'music_1',
+        subject: { type: 'Sound Element', id: music.id ?? 'music_1', label: 'Music Cue' },
+        model: selection.model,
+        costUsd,
+        artifactPath: audioPath,
+      });
       return true;
     } catch (err) {
       state.eventLog.push(`Music generation fallback: ${(err as Error).message}`);
     }
   }
 
-  hooks.onProgress?.(`Rendering temporary procedural music cue ${music.id ?? 'music_1'}.`);
+  progressActivity(runtime, hooks, state, 'Rendering temporary Music Cue', {
+    detail: music.id ?? 'music_1',
+    subject: { type: 'Sound Element', id: music.id ?? 'music_1', label: 'Music Cue' },
+  });
   await renderProceduralMusic({
     outputPath,
     durationSeconds: state.production.target.runtimeSeconds,
@@ -1278,6 +1518,14 @@ async function ensureFilmMusic(
     createdAt: new Date().toISOString(),
   });
   state.eventLog.push(`Rendered temporary procedural music cue ${music.id ?? 'music_1'} because OpenRouter audio generation was unavailable.`);
+  emitActivity(runtime, hooks, state, {
+    kind: 'artifact',
+    level: 'success',
+    title: 'Temporary Music Cue ready',
+    detail: music.id ?? 'music_1',
+    subject: { type: 'Sound Element', id: music.id ?? 'music_1', label: 'Music Cue' },
+    artifactPath: audioPath,
+  });
   return true;
 }
 
@@ -1358,6 +1606,7 @@ async function generateApprovedTake(
     generateAudio: boolean;
     spendCeilingUsd?: number;
   },
+  hooks: ToolProgressHooks = {},
 ): Promise<{
   state: ProductionState;
   takeId: string;
@@ -1386,6 +1635,13 @@ async function generateApprovedTake(
   });
   const selectedModel = selection.model;
   recordModalityModel(state, 'video', selection);
+  emitActivity(runtime, hooks, state, {
+    kind: 'model',
+    title: 'Routed video generation',
+    detail: selection.reason,
+    subject: { type: 'Shot', id: shot.id },
+    model: selectedModel.id,
+  });
   validateVideoModel(selectedModel, shot.durationSeconds, state.production.target.aspectRatio);
   const generateAudio = filmPackageHasExternalAudio(state) ? false : options.generateAudio;
   const references = await videoReferenceInputsForShot(dir, state, shot, selectedModel);
@@ -1411,6 +1667,14 @@ async function generateApprovedTake(
   if (state.production.budgetGuardrail.spentUsd + estimatedCost > budgetCeiling) {
     throw new Error(`Estimated cost $${estimatedCost.toFixed(4)} would exceed budget ceiling $${budgetCeiling.toFixed(2)}.`);
   }
+  emitActivity(runtime, hooks, state, {
+    kind: 'cost',
+    title: 'Estimated Take cost',
+    detail: `${take.id} for ${shot.id}`,
+    subject: { type: 'Take', id: take.id, label: shot.id },
+    model: selectedModel.id,
+    costUsd: estimatedCost,
+  });
 
   take.model = selectedModel.id;
   take.request = request;
@@ -1422,14 +1686,36 @@ async function generateApprovedTake(
   take.jobId = submitted.id;
   take.status = submitted.status === 'failed' ? 'failed' : 'in_progress';
   state.eventLog.push(`Submitted real video job ${submitted.id} for ${take.id}.`);
+  emitActivity(runtime, hooks, state, {
+    kind: 'progress',
+    title: 'Video job submitted',
+    detail: submitted.id,
+    subject: { type: 'Take', id: take.id, label: shot.id },
+    model: selectedModel.id,
+  });
   await saveProductionState(dir, state);
   await renderProductionPages(state, dir);
 
-  const completed = await waitForVideo(runtime.apiKey, submitted);
+  const completed = await waitForVideo(runtime.apiKey, submitted, (job) => {
+    emitActivity(runtime, hooks, state, {
+      kind: 'progress',
+      title: 'Waiting on video job',
+      detail: `${job.id} is ${job.status}`,
+      subject: { type: 'Take', id: take.id, label: shot.id },
+      model: selectedModel.id,
+    });
+  });
   if (completed.status !== 'completed') {
     take.status = 'failed';
     take.generationId = completed.generation_id;
     state.eventLog.push(`Video job ${completed.id} failed: ${JSON.stringify(completed.error ?? completed.status)}`);
+    emitActivity(runtime, hooks, state, {
+      kind: 'blocked',
+      level: 'error',
+      title: 'Video job failed',
+      detail: JSON.stringify(completed.error ?? completed.status),
+      subject: { type: 'Take', id: take.id, label: shot.id },
+    });
     await saveProductionState(dir, state);
     await renderProductionPages(state, dir);
     throw new Error(`Video job failed: ${JSON.stringify(completed.error ?? completed.status)}`);
@@ -1463,6 +1749,16 @@ async function generateApprovedTake(
     createdAt: new Date().toISOString(),
   });
   state.eventLog.push(`Downloaded real video for ${take.id} to ${relativePath}.`);
+  emitActivity(runtime, hooks, state, {
+    kind: 'artifact',
+    level: 'success',
+    title: 'Take media ready',
+    detail: `${take.id} for ${shot.id}`,
+    subject: { type: 'Take', id: take.id, label: shot.id },
+    model: selectedModel.id,
+    costUsd: actualCost,
+    artifactPath: relativePath,
+  });
   await saveProductionState(dir, state);
   await renderProductionPages(state, dir);
 
@@ -1645,13 +1941,18 @@ function estimateVideoCost(model: VideoModel, input: { durationSeconds: number; 
   return unitPrice * input.durationSeconds;
 }
 
-async function waitForVideo(apiKey: string, submitted: VideoJob): Promise<VideoJob> {
+async function waitForVideo(
+  apiKey: string,
+  submitted: VideoJob,
+  onPoll?: (job: VideoJob) => void,
+): Promise<VideoJob> {
   const start = Date.now();
   const intervalMs = Number(process.env.SHOWRUNNER_VIDEO_POLL_MS ?? 15000);
   const maxWaitMs = Number(process.env.SHOWRUNNER_VIDEO_MAX_WAIT_MS ?? 900000);
   let latest = submitted;
   while (Date.now() - start < maxWaitMs) {
     if (latest.status === 'completed' || latest.status === 'failed') return latest;
+    onPoll?.(latest);
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
     latest = await pollVideoJob(apiKey, latest.polling_url ?? latest.id);
   }

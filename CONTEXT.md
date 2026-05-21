@@ -156,11 +156,20 @@ _Avoid_: Background audio, afterthought, optional polish
 A human-readable HTML surface that presents **Production State** dynamically for review, steering, and handoff.
 _Avoid_: Markdown report, progress log, static notes
 
+**Production Activity**:
+The structured live event stream that explains what Showrunner is doing during planning, Reference generation, Take generation, Sound Mix, Export, approvals, costs, artifacts, and blockers.
+_Avoid_: Raw chain of thought, spinner text, console spam
+
+**Production Console**:
+The TUI surface that renders **Production Activity** automatically while a **Production** is being planned, generated, repaired, finished, or exported.
+_Avoid_: Debug command, hidden trace, manual status check
+
 ## Relationships
 
 - A **Production** contains one or more ordered **Scenes**.
 - A **Production** owns the creative, budget, and delivery constraints for its **Scenes**.
 - A **Production** has one **Production State** as its machine-readable source of truth.
+- A **Production** emits **Production Activity** while it is being planned, generated, repaired, finished, or exported.
 - A **Persistent Thread** can refer to one active **Production**.
 - A **Thread Summary** compacts older **Persistent Thread** turns.
 - **Context Compaction** must preserve the active **Production State** reference.
@@ -169,6 +178,7 @@ _Avoid_: Markdown report, progress log, static notes
 - The **Showrunner Controller** delegates to **Role Agents**.
 - A **Role Agent** can have one **Role Model** selected through OpenRouter model discovery.
 - A **Production Page** renders from **Production State**.
+- A **Production Console** renders live **Production Activity** in the TUI.
 - A **Production** owns one **Production Process** before the **Story Treatment** is trusted.
 - A **Production** owns one **Story Treatment** before paid **References** or **Takes**.
 - A **Production** owns one **Audio Strategy** that determines whether **Dialogue**, **Narration**, **Music Cues**, or **Native Take Audio** are required.

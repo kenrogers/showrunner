@@ -1,5 +1,7 @@
 # Showrunner
 
+![Showrunner terminal banner](docs/assets/showrunner-banner.png)
+
 Showrunner is a local-first video-production agent harness for planning, generating, reviewing, and assembling AI video work through OpenRouter.
 
 It starts from a natural-language brief, creates a structured Production, plans Scenes and Shots, routes text/image/video/speech/music model work, tracks Budget Guardrails, preserves provenance, and renders static HTML Production Pages for review and handoff.
@@ -33,6 +35,7 @@ Inside the TUI:
 ```text
 /new <brief>              create a Production from a natural-language brief
 /status                   show the active Production State summary
+/activity                 show recent events, routing, approvals, costs, and artifacts
 /next                     run the next recommended stage action
 /page                     render static HTML Production Pages
 /models video             inspect OpenRouter video model surfaces
@@ -49,6 +52,8 @@ Paid generation paths require an explicit budget in the prompt, for example:
 run full production with up to $5
 regenerate shot_3 with up to $1
 ```
+
+During planning, paid generation, repair, finishing, and export runs, Showrunner prints a live Production Console with the current stage, active operation, model choices, costs, artifact paths, and blockers. `/activity` remains available as a historical/debug view, but users do not need to ask for it during production work.
 
 ## Configuration
 

@@ -5,7 +5,7 @@ import { basename, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { DEFAULT_SHOWRUNNER_MODEL, loadConfig, type AgentConfig } from './config.js';
 import { runShowrunnerAgent, type AgentEvent } from './agent.js';
-import { materializeProductionArtifacts } from './artifacts.js';
+import { inspectArtifacts, materializeProductionArtifacts } from './artifacts.js';
 import { applyAction, legalActions, nextRecommendedAction, summarizeState, type ControllerAction } from './domain/controller.js';
 import { createInitialState, loadProductionState, productionDir, saveProductionState } from './domain/state.js';
 import type { ProductionState } from './domain/schema.js';
@@ -24,6 +24,8 @@ import { printBanner, printModelHint, printTryBrief } from './banner.js';
 import { detectBg } from './terminal-bg.js';
 import { Loader } from './loader.js';
 import { TuiRenderer } from './renderer.js';
+import { createProductionActivitySink, type ProductionActivitySink } from './activity.js';
+import { ProductionConsole } from './production-console.js';
 import { rebuildReferenceSetsFromCurrentState } from './references.js';
 import { regenerateShotsWithOpenRouter, runFullProductionWithOpenRouter, type ToolRuntime } from './tools/index.js';
 import { createSessionLog, type SessionLog } from './session-log.js';
@@ -112,6 +114,7 @@ async function handleLine(raw: string, runtime: Runtime): Promise<boolean> {
     if (await handleModelIntent(line, runtime)) return true;
     if (await handleContextIntent(line, runtime)) return true;
     if (await handleProductionStatusIntent(line, runtime)) return true;
+    if (await handleActivityIntent(line, runtime)) return true;
     if (await handleFullProductionIntent(line, runtime)) return true;
     if (await handleProductionChoiceIntent(line, runtime)) return true;
     if (await handleRegenerateShotsIntent(line, runtime)) return true;
@@ -130,12 +133,19 @@ async function handleLine(raw: string, runtime: Runtime): Promise<boolean> {
     const renderer = runtime.interactive ? new TuiRenderer() : undefined;
     let seenEvent = false;
     let lastToolResult: Extract<AgentEvent, { type: 'tool_result' }> | undefined;
+    const activity = createRuntimeActivity(runtime, {
+      onFirstEvent: () => {
+        seenEvent = true;
+        loader?.stop();
+      },
+    });
     loader?.start();
     const text = await runShowrunnerAgent(line, {
       config: runtime.config,
       getProductionDir: () => runtime.currentDir,
       setProductionDir: (dir) => { runtime.currentDir = dir; },
       threadContext,
+      activity: activity.sink,
       onEvent: renderer ? (event) => {
         void runtime.sessionLog.write('agent_event', event).catch(() => {});
         if (event.type === 'tool_result') lastToolResult = event;
@@ -145,8 +155,10 @@ async function handleLine(raw: string, runtime: Runtime): Promise<boolean> {
         }
         renderer.handle(event);
       } : undefined,
+    }).finally(() => {
+      loader?.stop();
+      activity.end();
     });
-    loader?.stop();
     renderer?.endTurn();
     const fallbackText = text.trim() ? text : toolOnlySummary(lastToolResult);
     if ((!seenEvent || !text.trim()) && fallbackText.trim()) console.log(`\n${fallbackText}\n`);
@@ -240,6 +252,18 @@ async function handleProductionStatusIntent(line: string, runtime: Runtime): Pro
   return true;
 }
 
+async function handleActivityIntent(line: string, runtime: Runtime): Promise<boolean> {
+  const normalized = line.toLowerCase().replace(/[?.!]+$/, '').trim();
+  const asksForActivity =
+    /^(activity|trace|events|recent events|what happened|what just happened|what is happening|what's happening|what are you doing)$/.test(normalized) ||
+    /^(show|display|give me)\s+(the\s+)?(activity|trace|events|recent events)$/.test(normalized) ||
+    /^what\s+is\s+showrunner\s+(doing|working on)$/.test(normalized);
+  if (!asksForActivity) return false;
+
+  await printActivityReport(runtime);
+  return true;
+}
+
 async function handleFullProductionIntent(line: string, runtime: Runtime): Promise<boolean> {
   if (!runtime.currentDir) return false;
   const approvedBudgetUsd = parseBudgetUsd(line);
@@ -260,6 +284,7 @@ async function handleFullProductionIntent(line: string, runtime: Runtime): Promi
   await saveProductionState(requireDir(runtime.currentDir), current);
 
   console.log(`${GREEN}Full production run approved:${RESET} real Reference images, real Takes, and verified export with a $${approvedBudgetUsd.toFixed(2)} cap.\n`);
+  const activity = createRuntimeActivity(runtime);
   const result = await runFullProductionWithOpenRouter(toToolRuntime(runtime), {
     approvedBudgetUsd,
     referenceBudgetUsd: Math.min(5, approvedBudgetUsd),
@@ -269,8 +294,8 @@ async function handleFullProductionIntent(line: string, runtime: Runtime): Promi
     maxReferences: 20,
     maxTakes: 20,
   }, {
-    onProgress: (message) => console.log(`${DIM}${message}${RESET}`),
-  });
+    activity: activity.sink,
+  }).finally(() => activity.end());
 
   runtime.currentDir = result.directory;
   runtime.state = await loadProductionState(result.directory);
@@ -332,6 +357,7 @@ async function handleRegenerateShotsIntent(line: string, runtime: Runtime): Prom
   requireState(runtime.state);
   console.log(`${GREEN}Repair approved:${RESET} regenerating ${shotIds.join(', ')} with a $${approvedBudgetUsd.toFixed(2)} cap.\n`);
 
+  const activity = createRuntimeActivity(runtime);
   const result = await regenerateShotsWithOpenRouter(toToolRuntime(runtime), {
     shotIds,
     approvedBudgetUsd,
@@ -339,8 +365,8 @@ async function handleRegenerateShotsIntent(line: string, runtime: Runtime): Prom
     generateAudio: true,
     refreshPrompts: true,
   }, {
-    onProgress: (message) => console.log(`${DIM}${message}${RESET}`),
-  });
+    activity: activity.sink,
+  }).finally(() => activity.end());
 
   runtime.currentDir = result.directory;
   runtime.state = await loadProductionState(result.directory);
@@ -547,54 +573,99 @@ function formatFullProductionResult(result: Awaited<ReturnType<typeof runFullPro
 async function createFreshProduction(runtime: Runtime, brief: string): Promise<string> {
   let state = createInitialState({ brief, routingPolicy: runtime.config.routingPolicy });
   applyBriefConstraints(state, brief);
-
-  console.log(`${GREEN}Starting fresh Production:${RESET} planning from the latest brief.`);
-  const directorModel = await routeTextModelDirect(runtime, state, 'director');
-  console.log(`${DIM}Planning storyboard with ${directorModel.model}.${RESET}`);
-  const plan = await planProductionWithOpenRouter({
-    apiKey: runtime.config.apiKey,
-    model: directorModel.model,
-    brief,
-    runtimeSeconds: state.production.target.runtimeSeconds,
+  const activity = createRuntimeActivity(runtime);
+  activity.sink.emit({
+    kind: 'run',
+    title: 'Planning new Production',
+    detail: state.production.title,
+    productionId: state.production.id,
+    stage: state.production.stage,
+    subject: { type: 'Production', id: state.production.id },
   });
-  applyProductionPlan(state, plan.plan);
 
-  const refinements = await refineCreativeTextDirect(runtime, state);
-  rebuildReferenceSetsFromCurrentState(state);
-  state.eventLog.push(`Created ${plan.source} storyboard plan${plan.model ? ` with ${plan.model}` : ''}: ${planSummary(plan.plan)}`);
-  for (const refinement of refinements) {
-    state.eventLog.push(refinementMessage(refinement));
-    if (refinement.warning) state.eventLog.push(`${refinement.scope} refinement warning: ${refinement.warning}`);
+  try {
+    console.log(`${GREEN}Starting fresh Production:${RESET} planning from the latest brief.`);
+    const directorModel = await routeTextModelDirect(runtime, state, 'director');
+    activity.sink.emit({
+      kind: 'model',
+      title: 'Routed Director planning',
+      productionId: state.production.id,
+      stage: state.production.stage,
+      model: directorModel.model,
+      subject: { type: 'Model', id: directorModel.model },
+    });
+    console.log(`${DIM}Planning storyboard with ${directorModel.model}.${RESET}`);
+    const plan = await planProductionWithOpenRouter({
+      apiKey: runtime.config.apiKey,
+      model: directorModel.model,
+      brief,
+      runtimeSeconds: state.production.target.runtimeSeconds,
+    });
+    applyProductionPlan(state, plan.plan);
+    activity.sink.emit({
+      kind: 'stage',
+      title: 'Storyboard plan ready',
+      detail: planSummary(plan.plan),
+      productionId: state.production.id,
+      stage: state.production.stage,
+      subject: { type: 'Production', id: state.production.id },
+    });
+
+    const refinements = await refineCreativeTextDirect(runtime, state);
+    rebuildReferenceSetsFromCurrentState(state);
+    state.eventLog.push(`Created ${plan.source} storyboard plan${plan.model ? ` with ${plan.model}` : ''}: ${planSummary(plan.plan)}`);
+    for (const refinement of refinements) {
+      state.eventLog.push(refinementMessage(refinement));
+      if (refinement.warning) state.eventLog.push(`${refinement.scope} refinement warning: ${refinement.warning}`);
+    }
+    if (plan.warning) state.eventLog.push(`Planner fallback warning: ${plan.warning}`);
+
+    const messages = [
+      'Production created.',
+      `Storyboard plan: ${planSummary(plan.plan)}`,
+      ...filmPackageDecisionMessages(state),
+      ...refinements.map(refinementMessage),
+    ];
+    for (let i = 0; i < 10; i++) {
+      const action = nextRecommendedAction(state);
+      if (!action || action.type === 'approve_pending') break;
+      const result = applyAction(state, action);
+      state = result.state;
+      messages.push(result.message);
+      activity.sink.emit({
+        kind: result.blocked ? 'blocked' : 'stage',
+        level: result.blocked ? 'warning' : 'info',
+        title: result.message,
+        productionId: state.production.id,
+        stage: state.production.stage,
+      });
+      if (result.blocked || state.approvals.some((approval) => approval.status === 'pending')) break;
+    }
+
+    const dir = productionDir(runtime.config.productionRoot, state);
+    await saveProductionState(dir, state);
+    const pages = await renderProductionPages(state, dir);
+    runtime.currentDir = dir;
+    runtime.state = state;
+    activity.sink.emit({
+      kind: 'complete',
+      level: 'success',
+      title: 'Production plan saved',
+      detail: dir,
+      productionId: state.production.id,
+      stage: state.production.stage,
+      artifactPath: pages[0],
+    });
+
+    return [
+      `${GREEN}Created fresh Production:${RESET} ${dir}`,
+      ...messages,
+      `Pages: ${pages.join(', ')}`,
+      summarizeState(state),
+    ].join('\n');
+  } finally {
+    activity.end();
   }
-  if (plan.warning) state.eventLog.push(`Planner fallback warning: ${plan.warning}`);
-
-  const messages = [
-    'Production created.',
-    `Storyboard plan: ${planSummary(plan.plan)}`,
-    ...filmPackageDecisionMessages(state),
-    ...refinements.map(refinementMessage),
-  ];
-  for (let i = 0; i < 10; i++) {
-    const action = nextRecommendedAction(state);
-    if (!action || action.type === 'approve_pending') break;
-    const result = applyAction(state, action);
-    state = result.state;
-    messages.push(result.message);
-    if (result.blocked || state.approvals.some((approval) => approval.status === 'pending')) break;
-  }
-
-  const dir = productionDir(runtime.config.productionRoot, state);
-  await saveProductionState(dir, state);
-  const pages = await renderProductionPages(state, dir);
-  runtime.currentDir = dir;
-  runtime.state = state;
-
-  return [
-    `${GREEN}Created fresh Production:${RESET} ${dir}`,
-    ...messages,
-    `Pages: ${pages.join(', ')}`,
-    summarizeState(state),
-  ].join('\n');
 }
 
 async function routeTextModelDirect(
@@ -737,6 +808,95 @@ async function printContextStatus(runtime: Runtime): Promise<void> {
   console.log(`  ${DIM}active production:${RESET} ${runtime.currentDir ?? runtime.thread.meta.activeProductionDir ?? '-'}\n`);
 }
 
+async function printActivityReport(runtime: Runtime): Promise<void> {
+  if (!runtime.state && runtime.currentDir) runtime.state = await loadProductionState(runtime.currentDir);
+  console.log(`${BOLD}Showrunner Activity${RESET}`);
+  console.log(`  ${DIM}session:${RESET} ${runtime.sessionLog.path}`);
+  console.log(`  ${DIM}model:${RESET} ${CYAN}${runtime.config.model}${RESET}`);
+
+  if (!runtime.state) {
+    console.log(`  ${DIM}active production:${RESET} -`);
+    console.log(`  ${DIM}next:${RESET} create a Production from a brief\n`);
+    return;
+  }
+
+  const state = runtime.state;
+  const pending = state.approvals.filter((approval) => approval.status === 'pending');
+  const nextAction = nextRecommendedAction(state)?.type;
+  console.log(`  ${DIM}active production:${RESET} ${runtime.currentDir ?? '-'}`);
+  console.log(`  ${DIM}stage:${RESET} ${state.production.stage}`);
+  console.log(`  ${DIM}next:${RESET} ${formatActionLabel(nextAction)}`);
+  console.log(`  ${DIM}legal actions:${RESET} ${legalActions(state).map(formatActionLabel).join(', ')}`);
+  console.log(`  ${DIM}budget:${RESET} $${state.production.budgetGuardrail.spentUsd.toFixed(2)} / $${state.production.budgetGuardrail.maxUsd.toFixed(2)}`);
+  console.log(`  ${DIM}pending approvals:${RESET} ${pending.length}`);
+  for (const approval of pending) {
+    const cost = approval.costUsd === undefined ? 'n/a' : `$${approval.costUsd.toFixed(2)}`;
+    console.log(`    ${YELLOW}${approval.kind}${RESET} ${approval.subjectId} ${GRAY}${cost}${RESET} ${approval.reason}`);
+  }
+
+  const roleModels = Object.entries(state.production.routing.roles ?? {});
+  if (roleModels.length > 0) {
+    console.log(`\n${BOLD}Role Routing${RESET}`);
+    for (const [role, selection] of roleModels) {
+      console.log(`  ${DIM}${role}:${RESET} ${CYAN}${selection.model}${RESET}`);
+    }
+  }
+
+  const mediaModels = Object.entries(state.production.routing.modalities ?? {});
+  if (mediaModels.length > 0) {
+    console.log(`\n${BOLD}Media Routing${RESET}`);
+    for (const [modality, selection] of mediaModels) {
+      console.log(`  ${DIM}${modality}:${RESET} ${selection.preferredModels.join(', ')}`);
+    }
+  }
+
+  if (state.costs.length > 0) {
+    console.log(`\n${BOLD}Recent Costs${RESET}`);
+    for (const cost of state.costs.slice(-8)) {
+      console.log(`  ${DIM}${cost.createdAt.slice(0, 19)}${RESET} ${cost.kind} ${cost.subjectId}: $${cost.costUsd.toFixed(4)}`);
+    }
+  }
+
+  if (runtime.currentDir) {
+    const artifacts = await inspectArtifacts(state, runtime.currentDir);
+    const visibleArtifacts = artifacts.filter((artifact) => artifact.exists || artifact.note).slice(0, 8);
+    if (visibleArtifacts.length > 0) {
+      console.log(`\n${BOLD}Artifacts${RESET}`);
+      for (const artifact of visibleArtifacts) {
+        const size = typeof artifact.sizeBytes === 'number' ? ` ${GRAY}${formatBytes(artifact.sizeBytes)}${RESET}` : '';
+        const status = artifact.exists ? `${GREEN}exists${RESET}` : `${YELLOW}missing${RESET}`;
+        console.log(`  ${status} ${artifact.kind} ${artifact.id}:${size} ${artifact.path}`);
+        if (artifact.note) console.log(`    ${DIM}${artifact.note}${RESET}`);
+      }
+    }
+  }
+
+  console.log(`\n${BOLD}Recent Events${RESET}`);
+  for (const event of state.eventLog.slice(-12)) {
+    console.log(`  ${GRAY}-${RESET} ${event}`);
+  }
+  console.log();
+}
+
+function createRuntimeActivity(runtime: Runtime, options: {
+  onFirstEvent?: () => void;
+} = {}): { sink: ProductionActivitySink; end: () => void } {
+  const consoleView = runtime.interactive ? new ProductionConsole() : undefined;
+  let seen = false;
+  const sink = createProductionActivitySink((event) => {
+    if (!seen) {
+      seen = true;
+      options.onFirstEvent?.();
+    }
+    void runtime.sessionLog.write('activity', event).catch(() => {});
+    consoleView?.handle(event);
+  });
+  return {
+    sink,
+    end: () => consoleView?.end(),
+  };
+}
+
 async function threadPolicy(runtime: Runtime, allowModelLookup: boolean): Promise<ThreadCompactionPolicy> {
   let contextWindowTokens = runtime.resolvedContextWindowTokens ?? runtime.thread.meta.contextWindowTokens ?? runtime.config.contextWindowTokens;
   if (allowModelLookup && !runtime.resolvedContextWindowTokens) {
@@ -822,6 +982,10 @@ async function dispatchCommand(command: string, args: string, runtime: Runtime):
       console.log(`${DIM}Legal actions:${RESET} ${legalActions(current).join(', ')}`);
       return;
     }
+    case '/activity':
+    case '/trace':
+      await printActivityReport(runtime);
+      return;
     case '/next': {
       const action = nextRecommendedAction(requireState(ctx.state));
       if (!action) {
@@ -922,6 +1086,7 @@ function printHelp(): void {
   console.log(`  ${CYAN}/new <brief>${RESET}     create a Production`);
   console.log(`  ${CYAN}/load <dir>${RESET}      load a Production directory`);
   console.log(`  ${CYAN}/status${RESET}          show Production State summary`);
+  console.log(`  ${CYAN}/activity${RESET}        show recent events, routing, approvals, costs, and artifacts`);
   console.log(`  ${CYAN}/next${RESET}            run the next recommended stage action`);
   console.log(`  ${CYAN}/approve${RESET}         approve the pending gate`);
   console.log(`  ${CYAN}/models video${RESET}    inspect OpenRouter model surfaces`);
@@ -995,6 +1160,10 @@ function toolOnlySummary(event: Extract<AgentEvent, { type: 'tool_result' }> | u
     return '';
   }
   return '';
+}
+
+function formatActionLabel(action: string | undefined): string {
+  return action ? action.replace(/_/g, ' ') : 'none';
 }
 
 function formatBytes(bytes: number): string {
